@@ -12,48 +12,64 @@ from bs4 import BeautifulSoup
 
 urllib3.disable_warnings()
 
+# 预设账号密码（可配置多个）
+PRESET_ACCOUNTS = [
+    {"username": "", "password": ""},
+    # 添加更多账号...
+]
+
 # ==========================================
 #              常量配置
 # ==========================================
-# 学校基本信息
-SCHOOL_CODE = "CODE"                           # 学校代码（用于登录加密）
-SCHOOL_HOST = "https://jw.example.edu.cn"         # 学校教务系统域名
-JWWEB_BASE = f"{SCHOOL_HOST}/jwweb"            # 教务系统基础路径
 
-# 教务系统URL路径（不同学校可能不同，请根据实际情况修改）
-URL_DEFAULT = "/Default.aspx"                   # 默认首页
-URL_LOGIN_HOME = "/_data/home_login.aspx"       # 登录页面
-URL_VALIDATE_CODE = "/sys/ValidateCode.aspx"   # 验证码接口
-URL_MAIN_FRAME = "/MAINFRM.aspx"               # 主框架页面
-URL_LOGOUT = "/sys/Logout.aspx"                # 登出接口
-URL_MAIN_TOOLS = "/SYS/Main_tools.aspx"        # 主工具页面（用于 Referer）
+# 学校基本信息 (提取自传统版)
+SCHOOL_CODE = "11451"
+SCHOOL_HOST = "https://jw.example.edu.cn"
+JWWEB_BASE = "https://jw.example.edu.cn/jwweb"
+
+# 教务系统URL路径
+URL_DEFAULT = "/Default.aspx"
+URL_LOGIN_HOME = "/_data/home_login.aspx"
+URL_VALIDATE_CODE = "/sys/ValidateCode.ashx"
+URL_MAIN_FRAME = "/MAINFRM.aspx"
+URL_LOGOUT = "/sys/Logout.aspx"
+URL_MAIN_TOOLS = "/SYS/Main_tools.aspx"
 
 # 选课相关URL路径
-URL_COURSE_SELECT = "/wsxk/stu_xszx.aspx"      # 正选主页
-URL_COURSE_REPORT = "/wsxk/stu_xszx_rpt.aspx"  # 课程报表页
-URL_CLASS_CHOOSE = "/wsxk/stu_xszx_chooseskbj.aspx"  # 选择班级页面
-URL_WITHDRAW_RESULT = "/wsxk/stu_txjg_rpt.aspx"      # 退选结果页面
+URL_COURSE_SELECT = "/wsxk/stu_xszx.aspx"
+URL_COURSE_REPORT = "/wsxk/stu_xszx_rpt.aspx"
+URL_CLASS_CHOOSE = "/wsxk/stu_xszx_chooseskbj.aspx"
+URL_WITHDRAW_RESULT = "/wsxk/stu_txjg_rpt.aspx"
 
-# 登录表单字段名（不同学校可能不同）
-LOGIN_FIELD_VIEWSTATE = '__VIEWSTATE'
-LOGIN_FIELD_EVENTVALIDATION = '__EVENTVALIDATION'
-LOGIN_FIELD_PCINFO = 'pcInfo'
-LOGIN_FIELD_USERNAME = 'txt_asmcdefsddsd'
-LOGIN_FIELD_PASSWORD = 'txt_pewerwedsdfsdff'
-LOGIN_FIELD_USERTYPE = 'typeName'
+# 登录字段名
+# 提示: 探测到以下潜在隐藏字段 (若自动识别失败可尝试): pcInfo, typeName, dsdsdsdsdxcxdfgfg, fgfggfdgtyuuyyuuckjg, txt_mm_expression, txt_mm_length, txt_mm_userzh, txt_mm_lxpd
+LOGIN_FIELD_VIEWSTATE = "__VIEWSTATE"
+LOGIN_FIELD_EVENTVALIDATION = "__EVENTVALIDATION"
+LOGIN_FIELD_PCINFO = "pcInfo"
+LOGIN_FIELD_USERNAME = "txt_asmcdefsddsd"
+LOGIN_FIELD_PASSWORD = "txt_pewerwedsdfsdff"
+LOGIN_FIELD_USERTYPE = "typeName"
+# ===========================================================================
 
-# ==========================================
 
 # User Agent
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-# 预设账号密码（可配置多个）
-PRESET_ACCOUNTS = [
-    {"username": "YOUR_ACCOUNT1", "password": "YOUR_PASSWORD1"},
-    {"username": "YOUR_ACCOUNT2", "password": "YOUR_PASSWORD2"},
-    # 添加更多账号...
-]
+
+
+# ==========================================
+#             延迟与频率限制配置
+# ==========================================
+# 网络请求超时时长 (连接超时时长, 读取超时时长)
+REQ_TIMEOUT = (30.0, 60.0)
+
+# 前端防刷限制时间集中管理 (单位：毫秒)
+DELAY_COURSE_REFRESH_MS = 5000  # 刷新课程列表冷却时间
+DELAY_CLASS_FETCH_MS = 4000     # 拉取班级详情冷却时间
+POLL_LOGS_MS = 2000             # 日志轮询间隔
+POLL_STATE_MS = 1000             # 状态轮询间隔
+POLL_PING_MS = 30000            # 延迟检测轮询间隔
 
 # ==========================================
 #             关键词和字段配置
@@ -220,6 +236,16 @@ log_queue = deque(maxlen=500)
 log_id_counter = [0]
 
 
+def format_net_err(e: Exception) -> str:
+    err_str = str(e)
+    if "10051" in err_str or "unreachable" in err_str:
+        return "网络已断开，或系统服务器不可达"
+    if "10060" in err_str or "Timeout" in err_str or "timeout" in err_str or "Read timed out" in err_str:
+        return "连接教务系统超时。服务器目前极度拥堵或您的网络信号差"
+    if "ConnectionError" in err_str or "Max retries exceeded" in err_str or "10054" in err_str:
+        return "连接教务系统失败或被服务器防火墙切断 (Connection Failed)"
+    return err_str
+
 def _track_activity(count_req=False):
     """统一更新 session 过期时间戳。若 count_req=True 则递增请求历史记录。"""
     with state_lock:
@@ -284,7 +310,7 @@ def check_session_alive():
     """检测当前 Session 是否仍然有效（未被挤掉/过期）。"""
     try:
         t0 = time.time()
-        r = session_get(build_url(URL_MAIN_FRAME), timeout=(3.0, 5.0))
+        r = session_get(build_url(URL_MAIN_FRAME), timeout=REQ_TIMEOUT)
         record_latency(int((time.time() - t0) * 1000))
         _track_activity()
         if any(kw in r.text for kw in SESSION_INVALID_KEYWORDS):
@@ -347,18 +373,18 @@ def keep_alive_loop():
                     _net_fail_count = 0
             else:
                 t0 = time.time()
-                _requests.head(build_url(URL_LOGIN_HOME), timeout=(3.0, 5.0), verify=False, allow_redirects=True)
+                _requests.head(build_url(URL_LOGIN_HOME), timeout=REQ_TIMEOUT, verify=False, allow_redirects=True)
                 record_latency(int((time.time() - t0) * 1000), kind="network")
                 _net_fail_count = 0
         except Exception as e:
             _net_fail_count += 1
             err_str = str(e)
-            is_network_err = any(kw in err_str for kw in ["NameResolution", "name resolution", "Temporary failure", "ConnectionError", "NewConnectionError", "MaxRetries", "Max retries"])
+            is_network_err = any(kw in err_str for kw in ["NameResolution", "name resolution", "Temporary failure", "ConnectionError", "NewConnectionError", "MaxRetries", "Max retries", "10051", "10060"])
             if is_network_err:
                 # 网络/DNS 临时故障，指数退避重试，不崩溃
                 backoff = min(60, 5 * _net_fail_count)
                 if _net_fail_count <= 3 or _net_fail_count % 10 == 0:
-                    push_log(f"::warning:: 网络暂时不可用 (第{_net_fail_count}次)，{backoff}秒后重试: {err_str[:80]}", "WARN")
+                    push_log(f"::warning:: 网络暂时不可用 (第{_net_fail_count}次)，{backoff}秒后重试: {format_net_err(e)}", "WARN")
                 time.sleep(backoff)
             # 其他异常静默忽略
 
@@ -379,9 +405,9 @@ def _do_login_inner(username, password):
         with session_lock:
             SESSION.cookies.clear()
         t0 = time.time()
-        session_get(build_url(URL_DEFAULT), timeout=(3.0, 5.0))
+        session_get(build_url(URL_DEFAULT), timeout=REQ_TIMEOUT)
         gate_url = build_url(URL_LOGIN_HOME)
-        res = session_get(gate_url, timeout=(3.0, 5.0))
+        res = session_get(gate_url, timeout=REQ_TIMEOUT)
         record_latency(int((time.time() - t0) * 1000))
         _track_activity()
         res.encoding = 'gbk'
@@ -389,7 +415,7 @@ def _do_login_inner(username, password):
         vs = soup.find('input', {'name': LOGIN_FIELD_VIEWSTATE})['value']
         ev = soup.find('input', {'name': LOGIN_FIELD_EVENTVALIDATION})['value']
 
-        session_get(build_url(URL_VALIDATE_CODE) + f"?t=0.{int(time.time() * 1000)}", timeout=(3.0, 5.0))
+        session_get(build_url(URL_VALIDATE_CODE) + f"?t=0.{int(time.time() * 1000)}", timeout=REQ_TIMEOUT)
         time.sleep(0.3)
 
         pwd_md5 = hashlib.md5(password.encode()).hexdigest().upper()[:30]
@@ -411,7 +437,7 @@ def _do_login_inner(username, password):
             gate_url,
             data=urllib.parse.urlencode(payload, encoding='gbk'),
             allow_redirects=True,
-            timeout=(3.0, 5.0),
+            timeout=REQ_TIMEOUT,
             headers=build_request_headers(gate_url, {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Origin": SCHOOL_HOST,
@@ -429,7 +455,7 @@ def _do_login_inner(username, password):
                 return False, alert_msg
 
         # 请求主页并验证是否真正进入了系统
-        main_resp = session_get(build_url(URL_MAIN_FRAME), timeout=(3.0, 5.0))
+        main_resp = session_get(build_url(URL_MAIN_FRAME), timeout=REQ_TIMEOUT)
         main_resp.encoding = 'gbk'
 
         if any(kw in main_resp.text for kw in SESSION_INVALID_KEYWORDS):
@@ -452,8 +478,8 @@ def _do_login_inner(username, password):
             push_log("::error:: 登录失败: 无法验证登录状态", "ERROR")
             return False, "无法确认登录成功"
     except Exception as e:
-        push_log(f"::error:: 登录异常: {e}", "ERROR")
-        return False, str(e)
+        push_log(f"::error:: 登录异常: {format_net_err(e)}", "ERROR")
+        return False, format_net_err(e)
 
 
 # ==========================================
@@ -468,7 +494,7 @@ def fetch_filters():
     """
     push_log("::network:: 正在获取筛选选项...")
     zx_url = build_url(URL_COURSE_SELECT)
-    r = session_get(zx_url, timeout=(3.0, 5.0), headers=build_request_headers(URL_MAIN_FRAME))
+    r = session_get(zx_url, timeout=REQ_TIMEOUT, headers=build_request_headers(URL_MAIN_FRAME))
     r.encoding = 'gbk'
     html = r.text
     soup = BeautifulSoup(html, 'html.parser')
@@ -540,7 +566,7 @@ def fetch_course_list(filter_params=None):
     push_log("::network:: 正在拉取课程列表...")
 
     # 1. 获取正选主页 VIEWSTATE
-    r = session_get(zx_url, timeout=(3.0, 5.0), headers=build_request_headers(URL_MAIN_FRAME))
+    r = session_get(zx_url, timeout=REQ_TIMEOUT, headers=build_request_headers(URL_MAIN_FRAME))
     r.encoding = 'gbk'
     soup_zx = BeautifulSoup(r.text, 'html.parser')
     vs = (soup_zx.find('input', {'name': LOGIN_FIELD_VIEWSTATE}) or {}).get('value', '')
@@ -559,7 +585,7 @@ def fetch_course_list(filter_params=None):
     r = session_post(
         rpt_url,
         data=urllib.parse.urlencode(sp, encoding='gbk'),
-        timeout=(3.0, 5.0),
+        timeout=REQ_TIMEOUT,
         headers=build_request_headers(zx_url, {
             "Content-Type": "application/x-www-form-urlencoded",
         })
@@ -598,8 +624,7 @@ def fetch_course_list(filter_params=None):
         disabled = cb.get('disabled') is not None
 
         # 从 value 中提取课程代码
-        code_m = re.search(r'\[(\d+)\]', value)
-        code = code_m.group(1) if code_m else ''
+        code = value.split('|')[0] if value else idx
 
         # 从表格单元格提取完整信息
         tds = tr.find_all('td')
@@ -607,7 +632,7 @@ def fetch_course_list(filter_params=None):
 
         # 课程名: 格式 "[代码]课程名称"，去掉代码部分只留名称
         raw_name = td_texts[1] if len(td_texts) > 1 else ''
-        course_name = re.sub(r'^\[\d+\]', '', raw_name).strip() or raw_name
+        course_name = re.sub(r'^\[.*?\]', '', raw_name).strip() or raw_name
         credit = td_texts[2] if len(td_texts) > 2 else ''      # 学分
         hours = td_texts[3] if len(td_texts) > 3 else ''        # 总学时
         category = td_texts[4] if len(td_texts) > 4 else ''     # 类别（公共课/必修课 等）
@@ -619,7 +644,15 @@ def fetch_course_list(filter_params=None):
 
         # 查找"查看"或"选择"按钮 —— 未选课账号是"选择"，已选课账号是"查看"
         look_a = tr.find('a', string=re.compile(r'查看|选择'))
-        look_value = look_a.get('value', value) if look_a else value
+        look_value = value
+        if look_a:
+            # 尝试从 href 或 onclick 中提取 id 参数
+            attr_str = str(look_a.get('href', '')) + str(look_a.get('onclick', ''))
+            id_match = re.search(r"""[?&]id=([^&'"]+)""", attr_str)
+            if id_match:
+                look_value = id_match.group(1)
+            else:
+                look_value = look_a.get('value', value)
 
         courses.append({
             "index": idx,
@@ -651,6 +684,19 @@ def fetch_class_list(course_value, skbjval="", xq="", silent=False):
     if not silent:
         push_log(f"::network:: 正在拉取班级列表...")
 
+    # 如果 course_value 包含 |，说明这是一个无需打开子班级弹窗的公选/直选课，强行发包将被校园网WAF拦截并断掉TCP(10051)
+    if '|' in course_value:
+        _cid = course_value.split('|')[2] if len(course_value.split('|')) > 2 else course_value.split('|')[0]
+        return [{
+            "class_id": _cid,
+            "class_name": "（无子班级）",
+            "teacher": "快捷直达通道",
+            "schedule": "该类课程已略过班级选择步骤，点 Start 即可生效",
+            "capacity": "",
+            "radio_value": "",
+            "course_value": course_value
+        }]
+
     base_url = build_url(URL_CLASS_CHOOSE)
 
     def _do_fetch():
@@ -664,7 +710,7 @@ def fetch_class_list(course_value, skbjval="", xq="", silent=False):
                     "skbjval": skbjval,
                     "xq": xq
                 },
-                timeout=(3.0, 5.0),
+                timeout=REQ_TIMEOUT,
                 headers=build_request_headers(URL_COURSE_REPORT)
             )
             req_ms = int((time.time() - t0) * 1000) if t0 is not None else -1
@@ -690,7 +736,7 @@ def fetch_class_list(course_value, skbjval="", xq="", silent=False):
         ok, msg = relogin_if_needed("fetch_class_list")
         if ok:
             push_log("::success:: 重新登录成功，重新拉取班级...", "SUCCESS")
-            session_get(build_url(URL_COURSE_SELECT), timeout=(3.0, 5.0), headers=build_request_headers(URL_MAIN_FRAME))
+            session_get(build_url(URL_COURSE_SELECT), timeout=REQ_TIMEOUT, headers=build_request_headers(URL_MAIN_FRAME))
             r = _do_fetch()
             if r is None:
                 return []
@@ -709,11 +755,14 @@ def fetch_class_list(course_value, skbjval="", xq="", silent=False):
 
     soup = BeautifulSoup(r.text, 'html.parser')
 
+    # 提取没有嵌套表格的纯净行为候选行
+    all_trs = [tr for tr in soup.find_all('tr') if not tr.find('table')]
+
     # 1. 动态表头识别：扫描前几行 tr 以建立列索引映射 (ColMap)
     col_map = {}
-    header_rows = soup.find_all('tr')[:4] # 扫描前4行寻找表头特征
+    header_rows = all_trs[:5] # 扫描前5行寻找表头特征
     for tr in header_rows:
-        ths = tr.find_all(['td', 'th'])
+        ths = tr.find_all(['td', 'th'], recursive=False)
         offset = 0
         for idx, th in enumerate(ths):
             text = th.get_text(strip=True)
@@ -730,13 +779,19 @@ def fetch_class_list(course_value, skbjval="", xq="", silent=False):
 
             offset += cspan
 
-
     classes = []
     # 2. 遍历所有表格行进行数据提取
-    for tr in soup.find_all('tr'):
-        sel_input = tr.find('input', {'type': ['radio', 'checkbox']})
-        if not sel_input or len(tr.find_all('input', {'type': ['radio', 'checkbox']})) > 2:
-            continue
+    for tr in all_trs:
+        sel_input = tr.find('input', {'type': ['radio', 'checkbox']}, recursive=False)
+        if not sel_input:
+            # 兼容有些 input 包裹在 td 里的情况
+            sel_inputs = tr.find_all('input', {'type': ['radio', 'checkbox']})
+            if not sel_inputs or len(sel_inputs) > 2:
+                continue
+            sel_input = sel_inputs[0]
+        else:
+            if len(tr.find_all('input', {'type': ['radio', 'checkbox']}, recursive=False)) > 2:
+                continue
 
         value = sel_input.get('value', '')
         if not value or '|' not in value:
@@ -746,7 +801,7 @@ def fetch_class_list(course_value, skbjval="", xq="", silent=False):
         class_id = parts[1] if len(parts) > 1 else (parts[0] if parts else '')
         class_num = class_id.split('-')[-1] if '-' in class_id else class_id
 
-        tds = tr.find_all(['td', 'th'])
+        tds = tr.find_all(['td', 'th'], recursive=False)
         cells = [td.get_text(strip=True) for td in tds]
         row_text = ' | '.join(cells)
 
@@ -840,7 +895,7 @@ def verify_selection(target_class_id):
     push_log(f"::search:: 正在验证选课结果 (班级={target_class_id})...")
     try:
         t0 = time.time() if should_measure_business_latency() else None
-        r = session_get(build_url(URL_WITHDRAW_RESULT), timeout=(3.0, 5.0))
+        r = session_get(build_url(URL_WITHDRAW_RESULT), timeout=REQ_TIMEOUT)
         req_ms = int((time.time() - t0) * 1000) if t0 is not None else -1
         if t0 is not None:
             record_latency(req_ms)
@@ -877,7 +932,7 @@ def submit_selection(strid, campus):
     r = session_post(
         url,
         data=urllib.parse.urlencode(payload, encoding='gbk'),
-        timeout=(3.0, 5.0),
+        timeout=REQ_TIMEOUT,
         headers=build_request_headers(URL_COURSE_REPORT, {
             "Content-Type": "application/x-www-form-urlencoded",
         })
@@ -897,6 +952,9 @@ def submit_selection(strid, campus):
 
     matched = [k for k in SNATCH_FAIL_KEYWORDS if k in text]
     if matched:
+        if '出错' in matched:
+            with open('C:/Users/ZhengXG/.gemini/antigravity/scratch/error_dump.html', 'w', encoding='utf-8', errors='ignore') as f:
+                f.write(text)
         return False, ', '.join(matched), req_ms
     return False, f"未知响应({len(text)}字节)", req_ms
 
@@ -970,6 +1028,7 @@ def snatch_loop():
     t_class_name = target.get("class_name", t_class_id)
     current_radio_val = target.get('radio_value', '')
     class_page_value = target.get('class_page_value') or target.get('course_value') or target.get('look_value') or target.get('value', '')
+    full_course_value = target.get('full_course_value') or class_page_value
     class_skbjval = target.get('class_skbjval', '')
 
     push_log(f"::success:: 开始选课，目标: {t_name} / {t_class_name}")
@@ -1073,7 +1132,7 @@ def snatch_loop():
             else:
                 skbj_token = t_class_id
 
-            strid = build_strid(skbj_token, class_page_value)
+            strid = build_strid(skbj_token, full_course_value)
             push_log(f"::success:: [{attempt}] 使用最新Token提交: {t_name} → {t_class_id}")
 
             app_state["snatch_phase"] = "requesting"
@@ -1142,12 +1201,11 @@ def snatch_loop():
                     return
 
         except Exception as e:
-            push_log(f"::warning:: [{attempt}] 请求发生异常: {e}", "ERROR")
             err_str = str(e)
-            # 网络异常：自动等待后重试
-            is_net = any(kw in err_str for kw in ["NameResolution", "ConnectionError", "MaxRetries", "Max retries", "Temporary failure"])
+            is_net = any(kw in err_str for kw in ["NameResolution", "ConnectionError", "MaxRetries", "Max retries", "Temporary failure", "10051", "10060"])
+            push_log(f"::warning:: [{attempt}] 请求发生异常: {format_net_err(e)}", "ERROR")
             if is_net:
-                push_log(f"::warning:: [{attempt}] 网络异常，30秒后重试...", "WARN")
+                push_log(f"::warning:: [{attempt}] 网络连接不稳，自动等待 30 秒后重试...", "WARN")
                 app_state["snatch_phase"] = "waiting"
                 app_state["snatch_phase_start"] = time.time()
                 app_state["snatch_interval"] = 30
@@ -1183,12 +1241,14 @@ def reverse_proxy(path):
         target_url += f"?{request.query_string.decode()}"
     fwd_headers = {"User-Agent": UA, "Referer": build_url(URL_COURSE_SELECT),
                    "Accept": request.headers.get('Accept', '*/*')}
+    if 'Content-Type' in request.headers:
+        fwd_headers['Content-Type'] = request.headers['Content-Type']
     try:
         if request.method == 'POST':
             resp = session_post(target_url, data=request.get_data(),
-                                headers=fwd_headers, timeout=(3.0, 5.0), allow_redirects=False, verify=False)
+                                headers=fwd_headers, timeout=REQ_TIMEOUT, allow_redirects=False, verify=False)
         else:
-            resp = session_get(target_url, headers=fwd_headers, timeout=(3.0, 5.0), allow_redirects=False, verify=False)
+            resp = session_get(target_url, headers=fwd_headers, timeout=REQ_TIMEOUT, allow_redirects=False, verify=False)
         if resp.status_code in (301, 302, 303, 307):
             return redirect(normalize_redirect(resp.headers.get('Location', '')), code=resp.status_code)
         ct = resp.headers.get('Content-Type', '')
@@ -1237,7 +1297,7 @@ def api_logout():
 
     if was_logged_in:
         try:
-            session_get(logout_url, headers=logout_headers, timeout=(3.0, 5.0), allow_redirects=True)
+            session_get(logout_url, headers=logout_headers, timeout=REQ_TIMEOUT, allow_redirects=True)
             push_log(f"::bye:: 已成功注销")
         except Exception as e:
             push_log(f"::warning:: 正常注销失败，继续本地销毁会话: {e}", "WARN")
@@ -1339,8 +1399,8 @@ def api_courses():
         result = fetch_course_list(filter_params)
         return jsonify(result)
     except Exception as e:
-        push_log(f"::error:: 拉取课程失败: {e}", "ERROR")
-        return jsonify({"status": "error", "msg": str(e)})
+        push_log(f"::error:: 拉取课程失败: {format_net_err(e)}", "ERROR")
+        return jsonify({"status": "error", "msg": format_net_err(e)})
 
 
 @app.route('/api/classes', methods=['POST'])
@@ -1362,8 +1422,9 @@ def api_classes():
             })
         return jsonify({"ok": True, "classes": classes})
     except Exception as e:
-        push_log(f"::error:: 拉取班级失败: {e}", "ERROR")
-        return jsonify({"ok": False, "msg": str(e)})
+        friendly_msg = format_net_err(e)
+        push_log(f"::error:: 拉取班级失败: {friendly_msg}", "ERROR")
+        return jsonify({"ok": False, "msg": friendly_msg})
 
 
 @app.route('/api/target', methods=['POST'])
@@ -1584,10 +1645,10 @@ input[type=number] { -moz-appearance: textfield; }
 .list-view .course-item {display:flex; flex-direction:column; gap:0; padding:0.75rem 1rem;}
 .list-view .course-item:hover {transform:translateX(2px) translateY(0);}
 .list-view .course-item.selected:hover {transform:none;}
-.list-view .course-info-row {display:flex; flex-direction:row; align-items:center; justify-content:space-between; gap:1.5rem; width:100%;}
-.list-view .c-name {margin-bottom:0; flex-basis:15%; flex-shrink:0;}
-.list-view .c-tags {margin-bottom:0; flex:1; align-items:center;}
-.list-view .c-cat  {margin-bottom:0; flex-basis:15%; flex-shrink:0; text-align:right;}
+.list-view .course-info-row {display:flex; flex-direction:row; align-items:center; justify-content:space-between; gap:1.0rem; width:100%;}
+.list-view .c-name {margin-bottom:0; flex:0 0 auto; max-width:35%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+.list-view .c-tags {margin-bottom:0; flex:1; align-items:center; justify-content:flex-end;}
+.list-view .c-cat  {margin-bottom:0; flex-basis:15%; flex-shrink:0; text-align:left;}
 .list-view .c-meta {margin-bottom:0; flex-basis:15%; flex-shrink:0; justify-content:flex-end; gap:0.6rem;}
 
 .tag{display:inline-block;padding:0.15rem 0.5rem;border-radius:6px;font-size:0.7rem;font-weight:500;background-color:var(--card);border:1px solid var(--border2);color:#ffffff;}
@@ -1596,6 +1657,10 @@ input[type=number] { -moz-appearance: textfield; }
 .class-item{background:var(--card2);border:1px solid var(--border);border-radius:var(--radius);padding:.8rem 1rem;cursor:pointer;transition:all .15s;}
 .class-item:hover{border-color:var(--accent);transform:translateY(-2px);}
 .class-item.selected{border-color:var(--green);background:#064e3b30;}
+
+.class-item-single{padding:.2rem 0.2rem;cursor:pointer;transition:all .15s;position:relative;overflow:hidden;}
+.class-item-single:hover{transform:translateX(4px);}
+.class-item-single.selected{color:inherit;}
 .log-line .msg .latency-note{color:var(--accent2);font-size:.72rem;opacity:.95;white-space:nowrap;}
 
 /* Target Banner */
@@ -1802,7 +1867,7 @@ select:focus, input:focus, button:focus {
     <div class="status"><div class="dot" id="statusDot"></div><span id="statusText">未登录</span></div>
     <button class="btn btn-ghost toolbar-mini-btn" id="btnToggleLogin" onclick="toggleSidebar()" style="display:none;"><span class="ico"><svg style="color:var(--text); vertical-align:-0.15em; width:1.2em; height:1.2em;" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" fill="currentColor"><path d="M288 277.333333a32 32 0 0 0-32 32v405.333334c0 17.664 14.336 32 32 32H362.666667a32 32 0 0 0 32-32v-405.333334a32 32 0 0 0-32-32H288z"/><path d="M213.333333 106.666667a128 128 0 0 0-128 128v554.666666a128 128 0 0 0 128 128h597.333334a128 128 0 0 0 128-128v-554.666666a128 128 0 0 0-128-128H213.333333z m597.333334 85.333333a42.666667 42.666667 0 0 1 42.666666 42.666667v554.666666a42.666667 42.666667 0 0 1-42.666666 42.666667H213.333333a42.666667 42.666667 0 0 1-42.666666-42.666667v-554.666666a42.666667 42.666667 0 0 1 42.666666-42.666667h597.333334z"/></svg></span> 控制面板</button>
     <button class="btn btn-ghost toolbar-mini-btn" id="btnLogoutHead" onclick="logout()" style="display:none;"><span class="ico"><svg style="color:var(--red);" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" fill="currentColor"><path d="M853.33 362.67v42.67a21.33 21.33 0 0 1-21.33 21.33H810.67v99.84a170.67 170.67 0 0 1-49.92 120.75l-83.2 85.33A128 128 0 0 1 597.33 768v149.33a21.33 21.33 0 0 1-21.33 21.33h-128a21.33 21.33 0 0 1-21.33-21.33V768a128 128 0 0 1-80.21-36.69l-83.2-85.33A170.67 170.67 0 0 1 213.33 526.51V426.67h-21.33a21.33 21.33 0 0 1-21.33-21.33v-42.67a21.33 21.33 0 0 1 21.33-21.33H298.67V106.67a21.33 21.33 0 0 1 21.33-21.33h42.67a21.33 21.33 0 0 1 21.33 21.33V341.33h256V106.67a21.33 21.33 0 0 1 21.33-21.33h42.67a21.33 21.33 0 0 1 21.33 21.33V341.33h106.67a21.33 21.33 0 0 1 21.33 21.33z"/></svg></span> 挂断会话</button>
-    <button class="btn btn-ghost toolbar-mini-btn" onclick="window.open('/jw${URL_COURSE_SELECT}', '_blank')"><span class="ico"><svg style="color:var(--accent);" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" fill="currentColor"><path d="M698.03 597.33C701.44 569.17 704 541.01 704 512 704 482.99 701.44 454.83 698.03 426.67L842.24 426.67C849.07 453.97 853.33 482.56 853.33 512 853.33 541.44 849.07 570.03 842.24 597.33M622.51 834.56C648.11 787.2 667.73 736 681.39 682.67L807.25 682.67C766.29 753.07 701.01 807.68 622.51 834.56M611.84 597.33 412.16 597.33C407.89 569.17 405.33 541.01 405.33 512 405.33 482.99 407.89 454.4 412.16 426.67L611.84 426.67C615.68 454.4 618.67 482.99 618.67 512 618.67 541.01 615.68 569.17 611.84 597.33M512 851.63C476.59 800.43 448 743.68 430.51 682.67L593.49 682.67C576 743.68 547.41 800.43 512 851.63M341.33 341.33 216.75 341.33C257.28 270.51 322.99 215.89 401.07 189.44 375.47 236.8 356.27 288 341.33 341.33M216.75 682.67 341.33 682.67C356.27 736 375.47 787.2 401.07 834.56 322.99 807.68 257.28 753.07 216.75 682.67M181.76 597.33C174.93 570.03 170.67 541.44 170.67 512 170.67 482.56 174.93 453.97 181.76 426.67L325.97 426.67C322.56 454.83 320 482.99 320 512 320 541.01 322.56 569.17 325.97 597.33M512 171.95C547.41 223.15 576 280.32 593.49 341.33L430.51 341.33C448 280.32 476.59 223.15 512 171.95M807.25 341.33 681.39 341.33C667.73 288 648.11 236.8 622.51 189.44 701.01 216.32 766.29 270.51 807.25 341.33M512 85.33C276.05 85.33 85.33 277.33 85.33 512 85.33 747.52 276.48 938.67 512 938.67 747.52 938.67 938.67 747.52 938.67 512 938.67 276.48 747.52 85.33 512 85.33Z"/></svg></span> 教务选课网页</button>
+    <button class="btn btn-ghost toolbar-mini-btn" onclick="window.open('/jw/wsxk/stu_xszx.aspx', '_blank')"><span class="ico"><svg style="color:var(--accent);" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" fill="currentColor"><path d="M698.03 597.33C701.44 569.17 704 541.01 704 512 704 482.99 701.44 454.83 698.03 426.67L842.24 426.67C849.07 453.97 853.33 482.56 853.33 512 853.33 541.44 849.07 570.03 842.24 597.33M622.51 834.56C648.11 787.2 667.73 736 681.39 682.67L807.25 682.67C766.29 753.07 701.01 807.68 622.51 834.56M611.84 597.33 412.16 597.33C407.89 569.17 405.33 541.01 405.33 512 405.33 482.99 407.89 454.4 412.16 426.67L611.84 426.67C615.68 454.4 618.67 482.99 618.67 512 618.67 541.01 615.68 569.17 611.84 597.33M512 851.63C476.59 800.43 448 743.68 430.51 682.67L593.49 682.67C576 743.68 547.41 800.43 512 851.63M341.33 341.33 216.75 341.33C257.28 270.51 322.99 215.89 401.07 189.44 375.47 236.8 356.27 288 341.33 341.33M216.75 682.67 341.33 682.67C356.27 736 375.47 787.2 401.07 834.56 322.99 807.68 257.28 753.07 216.75 682.67M181.76 597.33C174.93 570.03 170.67 541.44 170.67 512 170.67 482.56 174.93 453.97 181.76 426.67L325.97 426.67C322.56 454.83 320 482.99 320 512 320 541.01 322.56 569.17 325.97 597.33M512 171.95C547.41 223.15 576 280.32 593.49 341.33L430.51 341.33C448 280.32 476.59 223.15 512 171.95M807.25 341.33 681.39 341.33C667.73 288 648.11 236.8 622.51 189.44 701.01 216.32 766.29 270.51 807.25 341.33M512 85.33C276.05 85.33 85.33 277.33 85.33 512 85.33 747.52 276.48 938.67 512 938.67 747.52 938.67 938.67 747.52 938.67 512 938.67 276.48 747.52 85.33 512 85.33Z"/></svg></span> 教务选课网页</button>
     <button class="btn btn-ghost toolbar-mini-btn" id="btnToggleLog" onclick="toggleLog()"><span class="ico"><svg style="color:#a78bfa;" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" fill="currentColor"><path d="M853.33 981.33H170.67c-23.47 0-42.67-19.2-42.67-42.67V85.33c0-23.47 19.2-42.67 42.67-42.67h682.67c23.47 0 42.67 19.2 42.67 42.67v853.33c0 23.47-19.2 42.67-42.67 42.67zm-618.67-85.33h554.67c12.8 0 21.33-8.53 21.33-21.33V149.33c0-12.8-8.53-21.33-21.33-21.33H234.67c-12.8 0-21.33 8.53-21.33 21.33v725.33c0 12.8 8.53 21.33 21.33 21.33z M654.93 334.93H369.07c-23.47 0-42.67-19.2-42.67-42.67s19.2-42.67 42.67-42.67h283.73c23.47 0 42.67 19.2 42.67 42.67 2.13 23.47-17.07 42.67-40.53 42.67zM654.93 524.8H369.07c-23.47 0-42.67-19.2-42.67-42.67s19.2-42.67 42.67-42.67h283.73c23.47 0 42.67 19.2 42.67 42.67 2.13 23.47-17.07 42.67-40.53 42.67zM654.93 710.4H369.07c-23.47 0-42.67-19.2-42.67-42.67s19.2-42.67 42.67-42.67h283.73c23.47 0 42.67 19.2 42.67 42.67 2.13 23.47-17.07 42.67-40.53 42.67z"/></svg></span> 展开日志</button>
   </div>
 </div>
@@ -2003,6 +2068,16 @@ select:focus, input:focus, button:focus {
 </div>
 
 <script>
+// ========================================================
+// 前端延迟与防刷限制时间集中管理 (单位：毫秒)
+// ========================================================
+const CONFIG_DELAY_COURSE_REFRESH = {{ DELAY_COURSE_REFRESH_MS }};  // 刷新课程列表防抖冷却时间
+const CONFIG_DELAY_CLASS_FETCH = {{ DELAY_CLASS_FETCH_MS }};     // 拉取班级详情防抖冷却时间
+const CONFIG_POLL_LOGS = {{ POLL_LOGS_MS }};             // 日志轮询间隔
+const CONFIG_POLL_STATE = {{ POLL_STATE_MS }};             // 状态轮询间隔
+const CONFIG_POLL_PING = {{ POLL_PING_MS }};            // 延迟检测轮询间隔
+// ========================================================
+
 const WAIT_ICON = `<span class="ico"><svg viewBox="0 0 1024 1024" version="1.1" xmlns="http://www.w3.org/2000/svg"><path d="M856 64c22.091 0 40 17.909 40 40s-17.909 40-40 40h-26.273c-14.244 141.436-94.29 297.85-202.86 366.539l-0.71 0.44v3.652l0.705 0.442c107.891 68.869 187.804 224.251 202.65 364.928L856 880c22.091 0 40 17.909 40 40s-17.909 40-40 40H168c-22.091 0-40-17.909-40-40s17.909-40 40-40l26.459 0.001c14.704-141.014 94.054-296.803 201.896-365.421l3.285-2.055v-0.423l-3.282-2.056C288.183 441.104 208.484 285.1 194.269 144H168c-22.091 0-40-17.909-40-40s17.909-40 40-40h688zM477.567 695.579l-0.559 0.564L371.046 804.98a16 16 0 0 0-4.536 11.117c-0.025 8.836 7.119 16.02 15.955 16.044l18.764 0.043c36.185 0.065 70.62 0.018 103.304-0.14l19.75-0.101c35.982-0.165 74.913-0.191 116.792-0.08a16 16 0 0 0 11.263-4.594c6.212-6.11 6.379-16.046 0.44-22.362l-0.254-0.264L545.62 695.966c-0.243-0.246-0.488-0.49-0.735-0.731-18.805-18.308-48.777-18.092-67.318 0.344zM442.76 361.015c-8.837 0.015-15.988 7.19-15.974 16.027a16 16 0 0 0 4.535 11.134l46.407 47.672c18.49 18.996 48.88 19.405 67.876 0.914a48 48 0 0 0 0.74-0.737l46.77-47.552c6.196-6.3 6.112-16.43-0.188-22.627a16 16 0 0 0-11.245-4.593l-14.526 0.014h-4.98a9356.27 9356.27 0 0 1-44.885-0.108l-11.698-0.06c-19.937-0.092-40.881-0.12-62.832-0.084z" fill="currentColor"></path></svg></span>`;
 // 常用 SVG 图标常量（避免重复内联）
 const ICO_PING = `<span class="ico"><svg style="color:var(--accent2);" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" fill="currentColor"><path d="M511.98 0a512 512 0 1 1-366.06 154.04a30.08 30.08 0 0 1 43.07 42.11A451.75 451.75 0 1 0 555.5 62.33L542.06 61.12v149.62a30.08 30.08 0 0 1-24.64 29.63L511.98 240.95a30.08 30.08 0 0 1-29.63-24.7l-0.51-5.44V0h30.14zM212.09 210.55L543.34 477.42a53.12 53.12 0 1 1-75.9 73.34L212.09 210.55z"/></svg></span>`;
@@ -2084,6 +2159,18 @@ function renderOrUpdateLogEntry(entry) {
   if (atBot) scroll.scrollTop = scroll.scrollHeight;
   return div;
 }
+const LOG_ICONS = {{ LOG_ICONS_JSON | safe }};
+
+function formatClientLogText(msg) {
+  if (typeof msg !== 'string') return msg;
+  for (const [key, svg] of Object.entries(LOG_ICONS)) {
+    if (msg.includes(key)) {
+      msg = msg.split(key).join(`<span class="ico">${svg}</span>`);
+    }
+  }
+  return msg;
+}
+
 function pushClientLog(msg, level='INFO') {
   const scroll = document.getElementById('logScroll');
   if (!scroll) return null;
@@ -2095,7 +2182,7 @@ function pushClientLog(msg, level='INFO') {
   timeSpan.className = 'time';
   msgSpan.className = 'msg';
   timeSpan.textContent = new Date().toLocaleTimeString('zh-CN', {hour12:false});
-  msgSpan.innerHTML = msg;
+  msgSpan.innerHTML = formatClientLogText(msg);
   div.appendChild(timeSpan);
   div.appendChild(msgSpan);
   scroll.appendChild(div);
@@ -2108,7 +2195,7 @@ function updateClientLog(lineEl, msg, level='INFO') {
   const timeSpan = lineEl.querySelector('.time');
   const msgSpan = lineEl.querySelector('.msg');
   if (timeSpan) timeSpan.textContent = new Date().toLocaleTimeString('zh-CN', {hour12:false});
-  if (msgSpan) msgSpan.innerHTML = msg;
+  if (msgSpan) msgSpan.innerHTML = formatClientLogText(msg);
   return lineEl;
 }
 function stopRateLimitCountdown(markDone = false) {
@@ -2372,7 +2459,7 @@ async function doLogin(forceImmediate = false) {
         const d = await performLoginRequest(u, p);
         if (d.ok) {
           switchToLoggedInUI();
-          setTimeout(() => fetchCourses(), 500);
+          // 用户要求不自动拉取课程: setTimeout(() => fetchCourses(), 500);
           break;
         }
         const msg = String(d.msg || '未知错误');
@@ -2393,8 +2480,8 @@ async function doLogin(forceImmediate = false) {
 let lastRefreshTime = 0;
 async function refreshCourses() {
   const now = Date.now();
-  if (now - lastRefreshTime < 4000) {
-    pushLog(WAIT_ICON + " 请等待 4 秒后再刷新课程列表", "WARN");
+  if (now - lastRefreshTime < CONFIG_DELAY_COURSE_REFRESH) {
+    pushClientLog(`::warning:: 请等待 ${CONFIG_DELAY_COURSE_REFRESH/1000} 秒后再刷新课程列表`, "WARN");
     return;
   }
   lastRefreshTime = now;
@@ -2484,6 +2571,7 @@ function renderClassesHTML(c) {
 
   if (dList.length === 0) return '<div style="padding:1rem;text-align:center;color:#f3f4f6;font-size:0.9rem;">没有符合筛选条件的班级</div>';
 
+  const isSingle = dList.length === 1;
   const items = dList.map((clsItem) => {
     const sel = selectedClass && selectedClass.class_id === clsItem.class_id ? ' selected' : '';
     const title = clsItem.class_name ? esc(clsItem.class_name) : (clsItem.location ? esc(clsItem.location) : esc(clsItem.class_id));
@@ -2509,7 +2597,8 @@ function renderClassesHTML(c) {
         }
     }
 
-    return `<div class="class-item${sel}" data-class-id="${esc(clsItem.class_id)}" style="position:relative; overflow:hidden; padding-bottom:1.1rem;" onclick="selectClassForCourse(event, '${esc(c.code)}', '${esc(clsItem.class_id)}')">
+    const containerCls = isSingle ? `class-item-single${sel}` : `class-item${sel}`;
+    return `<div class="${containerCls}" data-class-id="${esc(clsItem.class_id)}" style="position:relative; overflow:hidden; padding-bottom:1.1rem;" onclick="selectClassForCourse(event, '${esc(c.code)}', '${esc(clsItem.class_id)}')">
       <div style="font-size:0.95rem; font-weight:600; color:#93c5fd; margin-bottom:0.4rem;">${title}</div>
       ${subTitle}
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
@@ -2524,7 +2613,8 @@ function renderClassesHTML(c) {
     </div>`;
   }).join('');
 
-  return `<div class="class-grid" style="margin-top:0.8rem; padding-top:0.8rem; border-top:1px dashed var(--border);">${items}</div>`;
+  const wrapperCls = isSingle ? '' : 'class-grid';
+  return `<div class="${wrapperCls}" style="margin-top:0.8rem; padding-top:0.8rem; border-top:1px dashed var(--border);">${items}</div>`;
 }
 
 let sortAsc = false;
@@ -2770,10 +2860,10 @@ setTimeout(initCustomSelects, 50);
   }
 
   const now = Date.now();
-  // 3秒间隔才能重新拉取任意班级，防风控（如果在加载中，或者距上次真正访问网络小于3秒）
-  if (isFetchingClasses || (now - lastFetchClassTime < 3000)) {
+  // 间隔一定时间才能重新拉取任意班级，防风控
+  if (isFetchingClasses || (now - lastFetchClassTime < CONFIG_DELAY_CLASS_FETCH)) {
      if (!c._classes) {
-        pushLog("等待拉取冷却中... (3秒间隔防封号保护)", "WARN");
+        pushClientLog(`::warning:: 等待班级拉取冷却中... (${CONFIG_DELAY_CLASS_FETCH/1000}秒防风控保护)`, "WARN");
         return;
      }
   }
@@ -2830,6 +2920,9 @@ setTimeout(initCustomSelects, 50);
            });
        }
        c._classes = clist;
+       if (clist.length === 1 && (!selectedClass || selectedClass.class_id !== clist[0].class_id)) {
+           setTimeout(() => selectClassForCourse(null, c.code, clist[0].class_id), 80);
+       }
     }
   } catch(e) {
     c._classFetchError = String(e);
@@ -2861,7 +2954,7 @@ function renderTargetBanner(course, clsItem) {
 }
 
 function selectClassForCourse(event, code, classId) {
-  event.stopPropagation();
+  if (event) event.stopPropagation();
   const c = courses.find(x => x.code === code);
   if (!c || !c._classes) return;
   selectedClass = c._classes.find(x => x.class_id === classId);
@@ -2888,6 +2981,7 @@ async function startSnatch() {
       class_id: selectedClass.class_id, class_name: `${selectedClass.class_id} ${selectedClass.teacher||''}`.trim(),
       radio_value: selectedClass.radio_value || '',
       class_page_value: selectedClass.course_value || selectedCourse.look_value || selectedCourse.value,
+      full_course_value: selectedCourse.value,
       class_skbjval: selectedClass.skbjval || selectedCourse.existing_class || '',
       xq: selectedClass.xq || params['sel_xq'] || '',
     },
@@ -2926,9 +3020,9 @@ let isPollingState = false;
 let isPollingPing = false;
 
 function startPolling() {
-  setInterval(pollLogs,2000);
-  setInterval(pollState,500);
-  setInterval(pollPing,30000);
+  setInterval(pollLogs, CONFIG_POLL_LOGS);
+  setInterval(pollState, CONFIG_POLL_STATE);
+  setInterval(pollPing, CONFIG_POLL_PING);
   pollPing();
   sessionCountdownInterval = setInterval(tickSessionCountdown, 1000);
 }
@@ -3190,7 +3284,16 @@ window.addEventListener("load", initCustomSelects);
 
 @app.route('/')
 def index():
-    return render_template_string(PANEL_HTML)
+    import json
+    return render_template_string(
+        PANEL_HTML,
+        DELAY_COURSE_REFRESH_MS=DELAY_COURSE_REFRESH_MS,
+        DELAY_CLASS_FETCH_MS=DELAY_CLASS_FETCH_MS,
+        POLL_LOGS_MS=POLL_LOGS_MS,
+        POLL_STATE_MS=POLL_STATE_MS,
+        POLL_PING_MS=POLL_PING_MS,
+        LOG_ICONS_JSON=json.dumps(LOG_ICON_MAP)
+    )
 
 
 if __name__ == '__main__':
