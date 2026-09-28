@@ -953,8 +953,13 @@ def submit_selection(strid, campus):
     matched = [k for k in SNATCH_FAIL_KEYWORDS if k in text]
     if matched:
         if '出错' in matched:
-            with open('C:/Users/ZhengXG/.gemini/antigravity/scratch/error_dump.html', 'w', encoding='utf-8', errors='ignore') as f:
-                f.write(text)
+            try:
+                dump_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'error_dump.html')
+                with open(dump_path, 'w', encoding='utf-8', errors='ignore') as f:
+                    f.write(text)
+                push_log(f"::warning:: 已保存出错响应到 {dump_path}", "WARN")
+            except Exception as dump_err:
+                push_log(f"::warning:: 保存出错响应失败: {dump_err}", "WARN")
         return False, ', '.join(matched), req_ms
     return False, f"未知响应({len(text)}字节)", req_ms
 
@@ -1108,13 +1113,15 @@ def snatch_loop():
                     if int(used) >= int(limit_part):
                         is_full = True
 
+            # 公选/直选课走"快捷直达"通道，页面本身不提供人数栏位（capacity 为空）。
+            # 这类课若因为解析不到人数就一直跳过提交，会永远选不上；所以只要不是
+            # 已知满员就直接提交，由服务器裁决（满了会返回"人数已满"）。
             if not is_valid_capacity:
-                push_log(f"::warning:: [{attempt}] 无法解析班级人数 ({capacity_raw})，跳过", "WARN")
+                push_log(f"::warning:: [{attempt}] 无法解析班级人数 ({capacity_raw!r})，改为直接提交由服务器裁决", "WARN")
 
             # --- 2. 收到回复后，完整倒计时 interval 秒再发下一次请求 ---
-            if is_full or not is_valid_capacity:
-                if is_full:
-                    push_log(f"::wait:: [{attempt}] 班级人数满 {capacity_raw}，{interval}s 后重试...{latency_suffix(class_fetch_ms)}")
+            if is_full:
+                push_log(f"::wait:: [{attempt}] 班级人数满 {capacity_raw}，{interval}s 后重试...{latency_suffix(class_fetch_ms)}")
                 app_state["snatch_phase"] = "waiting"
                 app_state["snatch_phase_start"] = time.time()
                 app_state["snatch_interval"] = interval
@@ -1122,8 +1129,11 @@ def snatch_loop():
                     return
                 continue
 
-            # === 人数未满！立刻构造 strid 并提交 ===
-            push_log(f"::success:: [{attempt}] 发现余量！({capacity_raw}) 准备发包...{latency_suffix(class_fetch_ms)}")
+            # === 人数未满（或人数未知）！立刻构造 strid 并提交 ===
+            if is_valid_capacity:
+                push_log(f"::success:: [{attempt}] 发现余量！({capacity_raw}) 准备发包...{latency_suffix(class_fetch_ms)}")
+            else:
+                push_log(f"::success:: [{attempt}] 人数未知（公选/直选课），直接发包...{latency_suffix(class_fetch_ms)}")
 
             if current_radio_val and '@' in current_radio_val:
                 skbj_token = current_radio_val.split('@', 1)[1]
