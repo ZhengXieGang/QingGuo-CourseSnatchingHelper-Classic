@@ -22,10 +22,10 @@ PRESET_ACCOUNTS = [
 #              常量配置
 # ==========================================
 
-# 学校基本信息 (提取自传统版)
-SCHOOL_CODE = "11451"
-SCHOOL_HOST = "https://jw.example.edu.cn"
-JWWEB_BASE = "https://jw.example.edu.cn/jwweb"
+# 学校基本信息
+SCHOOL_CODE = "11451"                           # 学校代码（用于登录加密；发布前请替换为示例值）
+SCHOOL_HOST = "https://jw.example.edu.cn"         # 学校教务系统域名（示例值，发布前请替换）
+JWWEB_BASE = f"{SCHOOL_HOST}/jwweb"            # 教务系统基础路径
 
 # 教务系统URL路径
 URL_DEFAULT = "/Default.aspx"
@@ -72,6 +72,39 @@ POLL_STATE_MS = 500             # 状态轮询间隔
 POLL_PING_MS = 30000            # 延迟检测轮询间隔
 
 # ==========================================
+#      选课流程适配参数（换学校/换版本时先看这里）
+# ==========================================
+# 课程范围（课程性质）筛选值。本系统里 "2" 表示"主修(公共任选)"，也就是公选课。
+# 注意：查询表单不传这个参数时，服务器会按"主修(本年级/专业)"返回，
+# 公选课列表会直接是空的——这是最容易踩的坑。
+SEL_LX_PUBLIC_ELECTIVE = "2"
+
+# 校区筛选值的默认值（页面下拉里只有一项时用它兜底）
+SEL_XQ_DEFAULT = "3"
+
+# 课程值里含 '|' 是否表示"无子班级、可以跳过班级选择弹窗"。
+#   False（推荐）= 先按正常流程打开班级弹窗，用弹窗里的 radio 值取班级号；
+#                  弹窗确实没有数据时才退回"快捷直达"派生规则做兜底。
+#   True          = 直接按"无子班级"处理（部分学校的纯直选课才这样）。
+# 设错会导致提交时班级号不对，服务器返回"系统出错"。
+PIPE_VALUE_MEANS_NO_SUBCLASS = False
+
+# 选课类请求节流：任意 SEL_PACE_WINDOW 秒内，发往教务系统的"选课类"请求
+# （课程列表/检索/班级弹窗/提交）不超过 SEL_PACE_MAX 次。
+# 这是硬性的客户端限速，不依赖手填的抢课间隔，防止触发防刷锁定。
+SEL_PACE_WINDOW = 20.0
+SEL_PACE_MAX = 3
+
+# 检索表单状态（sel_xnxq / mcount / VIEWSTATE 等）的缓存秒数。
+# 这些值一个学期内都不变，缓存后每回合的选课请求可从 4 个降到 2 个；
+# 提交失败时会自动失效重取。
+RPT_STATE_TTL = 600
+
+# 保留最近多少次提交的请求/响应，便于事后排障（0 = 关闭）。
+# 内容仅保存在内存中，可通过 GET /api/submit_history 查看。
+SUBMIT_HISTORY_KEEP = 5
+
+# ==========================================
 #             关键词和字段配置
 # ==========================================
 # 登录相关关键词
@@ -80,7 +113,12 @@ LOGIN_FAIL_KEYWORDS = ['不正确', '不存在', '密码', '错误', '失败', '
 SESSION_INVALID_KEYWORDS = ['重新', '无权', 'login_home']
 
 # 选课相关关键词
-SNATCH_SUCCESS_KEYWORDS = ['正选成功', '选课成功', '操作成功', '已完成', '成功', '重复', '已选']
+# 注意：这里**不要**放裸的 '成功'。教务系统页面里到处是"尚未开始/操作不成功"这类
+# 字样，关键词命中了就会把失败当成选课成功、提前结束抢课循环。判定结果一律以
+# verify_selection() 查退选报表页为准（见 snatch_loop，复核是强制的）。
+SNATCH_SUCCESS_KEYWORDS = ['正选成功', '选课成功', '操作成功', '提交正选成功', '已完成']
+# 这些回应表示"该课程此前已经选上过了"，同样需要复核确认，但不是本次新选上
+SNATCH_ALREADY_KEYWORDS = ['已选', '重复', '已经选过']
 SNATCH_FAIL_KEYWORDS = ['人数已满', '已满', '冲突', '失败', '不允许', '尚未开始', '非正选时间',
                         '无权访问', '超出', '错误', '超过5次', '锁定', '等待', '出错']
 RATE_LIMIT_KEYWORDS = ['刷新频率超过', '已经被锁定', '频率超过', '等待']
@@ -94,6 +132,29 @@ SNATCH_STOP_KEYWORDS = ['重复', '无权', '冲突', '出错']
 # ==========================================
 app = Flask(__name__)
 app.secret_key = "secure-qk-v6-2026-dynamic-static-key"
+
+# 本工具的控制接口没有登录鉴权（设计上只绑在本机 127.0.0.1）。
+# 但浏览器里打开的任意网页都能悄悄向 127.0.0.1 发跨站 POST（CSRF），
+# 从而驱动抢课、甚至读到预设账号的密码。这里只拦截"带跨站 Origin 的
+# 状态变更请求"：浏览器发跨站请求一定带 Origin，而本机脚本/命令行不带，
+# 所以正常使用与自动化脚本都不受影响。
+_LOCAL_ORIGIN_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", ""}
+
+
+@app.before_request
+def _guard_cross_site_request():
+    if request.method.upper() not in ("POST", "PUT", "PATCH", "DELETE"):
+        return None
+    origin = request.headers.get("Origin")
+    if origin:
+        try:
+            host = urllib.parse.urlparse(origin).hostname or ""
+        except Exception:
+            host = ""
+        if host not in _LOCAL_ORIGIN_HOSTS:
+            return jsonify({"ok": False, "msg": "拒绝来自非本机页面的状态变更请求"}), 403
+    return None
+
 
 # 屏蔽内部轮询路由的日志输出，避免命令行刷屏
 import logging
@@ -173,7 +234,34 @@ def create_session():
 SESSION = create_session()
 
 
+# 选课类请求的滑动窗口节流。教务系统的防刷策略一旦触发会把账号锁定若干分钟，
+# 抢课期间被锁反而更慢，所以这里做硬性客户端限速。
+_course_req_times = deque()
+_course_req_lock = threading.Lock()
+
+
+def pace_course_request():
+    """在发送选课类请求前调用：保证任意 SEL_PACE_WINDOW 秒内不超过 SEL_PACE_MAX 次。"""
+    while True:
+        with _course_req_lock:
+            now = time.time()
+            while _course_req_times and now - _course_req_times[0] > SEL_PACE_WINDOW:
+                _course_req_times.popleft()
+            if len(_course_req_times) < SEL_PACE_MAX:
+                _course_req_times.append(now)
+                return
+            wait = _course_req_times[0] + SEL_PACE_WINDOW - now
+        if wait <= 0:
+            continue
+        push_log(f"::wait:: 选课请求节流：{SEL_PACE_WINDOW:.0f}s 内已发 {SEL_PACE_MAX} 次，"
+                 f"等待 {wait:.1f}s 再发", "WARN")
+        time.sleep(min(wait, 2.0))
+
+
 def session_request(method, url, **kwargs):
+    # pace=True 时先过选课节流闸门（登录流程不节流，避免开抢瞬间被拖慢）
+    if kwargs.pop('pace', False):
+        pace_course_request()
     with session_lock:
         return SESSION.request(method, url, **kwargs)
 
@@ -229,6 +317,7 @@ app_state = {
     "target_capacity_live": "",  # 抢课过程中实时更新的目标班级人数（用于前端无感更新）
     "rate_limit_active": False,
     "rate_limit_until": 0,
+    "dry_run": False,           # 演练模式：走到提交步骤前停下，只打印将发送的表单，不真正提交
 }
 
 # 日志
@@ -566,7 +655,7 @@ def fetch_course_list(filter_params=None):
     push_log("::network:: 正在拉取课程列表...")
 
     # 1. 获取正选主页 VIEWSTATE
-    r = session_get(zx_url, timeout=REQ_TIMEOUT, headers=build_request_headers(URL_MAIN_FRAME))
+    r = session_get(zx_url, timeout=REQ_TIMEOUT, headers=build_request_headers(URL_MAIN_FRAME), pace=True)
     r.encoding = 'gbk'
     soup_zx = BeautifulSoup(r.text, 'html.parser')
     vs = (soup_zx.find('input', {'name': LOGIN_FIELD_VIEWSTATE}) or {}).get('value', '')
@@ -577,6 +666,10 @@ def fetch_course_list(filter_params=None):
     sp = OrderedDict([
         (LOGIN_FIELD_VIEWSTATE, vs), ("__VIEWSTATEGENERATOR", vsg), (LOGIN_FIELD_EVENTVALIDATION, ev),
         ("SelSpeciality", ""), ("kc", ""), ("btn_search", "检索"),
+        # 课程范围（性质）筛选值，见文件顶部 SEL_LX_PUBLIC_ELECTIVE 的说明：
+        # 不传这个参数时服务器按"主修(本年级/专业)"返回，公选课列表会是空的。
+        # 调用方传入的同名参数仍会覆盖这里。
+        ("sel_lx", SEL_LX_PUBLIC_ELECTIVE),
     ])
     for k, v in filter_params.items():
         if k.startswith('sel') or k.startswith('Sel'):
@@ -588,7 +681,8 @@ def fetch_course_list(filter_params=None):
         timeout=REQ_TIMEOUT,
         headers=build_request_headers(zx_url, {
             "Content-Type": "application/x-www-form-urlencoded",
-        })
+        }),
+        pace=True
     )
     req_ms = int((time.time() - t0) * 1000) if t0 is not None else -1
     if t0 is not None:
@@ -675,6 +769,33 @@ def fetch_course_list(filter_params=None):
     return {"status": "ok", "courses": courses}
 
 
+def _quick_direct_class(course_value):
+    """
+    "快捷直达"兜底通道：把含 '|' 的课程值当成"无子班级"的课程，用第 1 段的
+    「课程代码%班级序号」派生一个班级号；同时给一个备用班级号（部分学校的值是
+    「课程代码|序号|班级号|…」的形式），提交被拒时会自动换用备用值再试一次。
+    """
+    seg = course_value.split('|')
+    _code, _, _seq = seg[0].partition('%')
+    try:
+        primary = f"{_code}-{int(_seq):03d}" if _seq else _code
+    except ValueError:
+        primary = f"{_code}-001" if _seq else _code
+    legacy = seg[2] if len(seg) > 2 else ''
+    if legacy == primary:
+        legacy = ''
+    return [{
+        "class_id": primary,
+        "alt_class_id": legacy,
+        "class_name": "（无子班级）",
+        "teacher": "快捷直达通道",
+        "schedule": "该类课程已略过班级选择步骤，点 Start 即可生效",
+        "capacity": "",
+        "radio_value": "",
+        "course_value": course_value,
+    }]
+
+
 def fetch_class_list(course_value, skbjval="", xq="", silent=False):
     """
     拉取指定课程的班级列表。
@@ -684,18 +805,16 @@ def fetch_class_list(course_value, skbjval="", xq="", silent=False):
     if not silent:
         push_log(f"::network:: 正在拉取班级列表...")
 
-    # 如果 course_value 包含 |，说明这是一个无需打开子班级弹窗的公选/直选课，强行发包将被校园网WAF拦截并断掉TCP(10051)
-    if '|' in course_value:
-        _cid = course_value.split('|')[2] if len(course_value.split('|')) > 2 else course_value.split('|')[0]
-        return [{
-            "class_id": _cid,
-            "class_name": "（无子班级）",
-            "teacher": "快捷直达通道",
-            "schedule": "该类课程已略过班级选择步骤，点 Start 即可生效",
-            "capacity": "",
-            "radio_value": "",
-            "course_value": course_value
-        }]
+    # 关于 course_value 里含 '|' 的情况，见文件顶部 PIPE_VALUE_MEANS_NO_SUBCLASS。
+    # 多数适配场景下（False）应当照常打开班级选择弹窗：
+    #   弹窗里 radio 的 value 形如 |<班级号>|[<班号>]<教师>@<教师号>$<...>$<班级号>$$<token>，
+    #   页面 JS 取它的 split('@')[1] 填进隐藏域 chkSKBJ，
+    #   提交 id = "TTT" + "," + chkSKBJ + "¤" + 复选框 value。
+    #   所以必须走正常路径拿 radio_value，snatch_loop 才能用 split('@')[1] 拼出正确 id。
+    #   （若把这类课程直接当"无子班级"处理，会塞进一个假班级号，提交时服务器报"系统出错"。）
+    # 只有在 PIPE_VALUE_MEANS_NO_SUBCLASS=True，或弹窗确实返回空时，才走"快捷直达"兜底。
+    if PIPE_VALUE_MEANS_NO_SUBCLASS and '|' in course_value:
+        return _quick_direct_class(course_value)
 
     base_url = build_url(URL_CLASS_CHOOSE)
 
@@ -711,7 +830,8 @@ def fetch_class_list(course_value, skbjval="", xq="", silent=False):
                     "xq": xq
                 },
                 timeout=REQ_TIMEOUT,
-                headers=build_request_headers(URL_COURSE_REPORT)
+                headers=build_request_headers(URL_COURSE_REPORT),
+                pace=True
             )
             req_ms = int((time.time() - t0) * 1000) if t0 is not None else -1
             if t0 is not None:
@@ -878,6 +998,12 @@ def fetch_class_list(course_value, skbjval="", xq="", silent=False):
             unique_classes.append(c)
 
     classes = unique_classes
+
+    if not classes and '|' in course_value:
+        # 兜底：班级弹窗确实没有数据时，才退回"快捷直达"派生规则
+        push_log("::warning:: 班级弹窗无数据，改走快捷直达通道兜底", "WARN")
+        classes = _quick_direct_class(course_value)
+
     if not silent:
         push_log(f"::clipboard:: 共 {len(classes)} 个班级可选{latency_suffix(getattr(r, '_req_ms', -1))}", "SUCCESS")
     return classes
@@ -921,13 +1047,147 @@ def verify_selection(target_class_id):
 # ==========================================
 #          选课提交 + 抢课引擎
 # ==========================================
-def submit_selection(strid, campus):
-    """提交选课，返回 (成功, 消息, 请求耗时ms)"""
-    url = build_url(URL_COURSE_REPORT) + "?func=1"
-    payload = OrderedDict([
-        ("id", strid), ("yxsjct", ""), ("sel_xq", campus),
+# ---------------------------------------------------------------
+# 检索表单状态缓存：sel_xnxq / mcount / VIEWSTATE 这些值一个学期内都不变，
+# 缓存后每回合的选课请求数可从 4 个降到 2 个（班级弹窗 + 提交），
+# 直接降低触发防刷锁定的概率。提交因页面状态问题失败时会失效重取。
+# ---------------------------------------------------------------
+_rpt_state_cache = {"ts": 0.0, "data": None}
+_rpt_state_lock = threading.Lock()
+# 最近若干次提交的请求/响应（仅内存），供 GET /api/submit_history 排障
+_submit_history = deque(maxlen=SUBMIT_HISTORY_KEEP or 1)
+
+
+def invalidate_rpt_state():
+    """让缓存的检索表单状态失效，下次提交前会重新检索。"""
+    with _rpt_state_lock:
+        _rpt_state_cache["ts"] = 0.0
+        _rpt_state_cache["data"] = None
+
+
+def fetch_rpt_state(campus, force=False):
+    """
+    发一次"检索"（等价于浏览器里点检索按钮），把提交选课所需的表单状态抓回来：
+    __VIEWSTATE / __EVENTVALIDATION / __VIEWSTATEGENERATOR / sel_xnxq（学年学期）/
+    mcount（列表行数）。
+
+    为什么必须这么做：提交表单里要带上 sel_xnxq、mcount 等字段，而这些值只有在
+    "检索之后"的页面里才是正确的当学期值——写死学期号的话，换学期就会失效并报
+    "系统出错"。带 __VIEWSTATE 也是 ASP.NET WebForms 的常规要求，不过有些部署的
+    选课提交页根本不含该字段，此时取到空值是正常的。
+
+    force=True 时忽略缓存强制重新检索。
+    """
+    with _rpt_state_lock:
+        cached = _rpt_state_cache["data"]
+        if (not force) and cached and (time.time() - _rpt_state_cache["ts"] < RPT_STATE_TTL):
+            return cached
+
+    st = {"viewstate": "", "eventvalidation": "", "viewstategenerator": "",
+          "sel_xnxq": "", "mcount": ""}
+    try:
+        zx = session_get(build_url(URL_COURSE_SELECT), timeout=REQ_TIMEOUT,
+                         headers=build_request_headers(URL_MAIN_FRAME), pace=True)
+        zx.encoding = 'gbk'
+        soup = BeautifulSoup(zx.text, 'html.parser')
+
+        def hval(s, name):
+            node = s.find('input', {'name': name}) or s.find('input', {'id': name})
+            return node.get('value', '') if node else ''
+
+        sp = OrderedDict([
+            (LOGIN_FIELD_VIEWSTATE, hval(soup, LOGIN_FIELD_VIEWSTATE)),
+            ("__VIEWSTATEGENERATOR", hval(soup, "__VIEWSTATEGENERATOR")),
+            (LOGIN_FIELD_EVENTVALIDATION, hval(soup, LOGIN_FIELD_EVENTVALIDATION)),
+            ("SelSpeciality", ""), ("kc", ""), ("btn_search", "检索"),
+            ("sel_lx", SEL_LX_PUBLIC_ELECTIVE),
+            ("sel_xq", campus or SEL_XQ_DEFAULT),
+        ])
+        r = session_post(
+            build_url(URL_COURSE_REPORT),
+            data=urllib.parse.urlencode(sp, encoding='gbk'),
+            timeout=REQ_TIMEOUT,
+            headers=build_request_headers(URL_COURSE_SELECT, {
+                "Content-Type": "application/x-www-form-urlencoded",
+            }),
+            pace=True
+        )
+        r.encoding = 'gbk'
+        soup2 = BeautifulSoup(r.text, 'html.parser')
+        st["viewstate"] = hval(soup2, LOGIN_FIELD_VIEWSTATE)
+        st["eventvalidation"] = hval(soup2, LOGIN_FIELD_EVENTVALIDATION)
+        st["viewstategenerator"] = hval(soup2, "__VIEWSTATEGENERATOR")
+        st["sel_xnxq"] = hval(soup2, "sel_xnxq")
+        st["mcount"] = hval(soup2, "mcount")
+        with _rpt_state_lock:
+            _rpt_state_cache["ts"] = time.time()
+            _rpt_state_cache["data"] = st
+    except Exception as e:
+        push_log(f"::warning:: 获取提交表单状态失败: {format_net_err(e)}", "WARN")
+    return st
+
+
+def build_submit_payload(strid, campus, st):
+    """按浏览器提交选课表单时的字段集合构造 payload。"""
+    return OrderedDict([
+        (LOGIN_FIELD_VIEWSTATE, st.get("viewstate", "")),
+        ("__VIEWSTATEGENERATOR", st.get("viewstategenerator", "")),
+        (LOGIN_FIELD_EVENTVALIDATION, st.get("eventvalidation", "")),
+        ("id", strid),
+        ("sel_xnxq", st.get("sel_xnxq", "")),
+        ("sel_xq", campus),
+        ("sel_lx", SEL_LX_PUBLIC_ELECTIVE),
+        ("mcount", st.get("mcount", "")),
+        ("SelSpeciality", ""),
+        ("yxsjct", ""),
         ("hid_ReturnStr", ""), ("hid_N", ""), ("txt_yzm", ""),
+        ("Submit", "提交正选"),
     ])
+
+
+def _record_submit(payload, text, ok, msg):
+    """把本次提交的字段与响应片段留档，便于事后排障（仅内存，不落盘）。"""
+    if SUBMIT_HISTORY_KEEP <= 0:
+        return
+    try:
+        _submit_history.append({
+            "time": time.strftime('%Y-%m-%d %H:%M:%S'),
+            "ts": time.time(),
+            "ok": ok, "msg": msg,
+            "request": {k: str(v)[:300] for k, v in payload.items()},
+            "response": (text or "")[:3000],
+        })
+    except Exception:
+        pass
+
+
+# 提交响应里出现这些词，基本可以确定是会话失效（不要用宽泛的 '重新'，会误判）
+SESSION_INVALID_SUBMIT_KEYWORDS = ['重新登录', '无权访问', 'login_home', '请先登录']
+# 这些失败意味着页面状态可能已过期，需要重新检索表单状态
+STATE_STALE_KEYWORDS = ['出错', '错误', '未登录', '无权']
+
+
+def submit_selection(strid, campus, dry_run=False):
+    """
+    提交选课，返回 (成功, 消息, 请求耗时ms)。
+    dry_run=True 时只打印将要发送的表单、不真正提交，用来在真实选课时段之前
+    把整条链路走一遍，确认参数都对。
+    """
+    st = fetch_rpt_state(campus)
+    payload = build_submit_payload(strid, campus, st)
+
+    if dry_run:
+        push_log("::warning:: [演练模式] 不会真正提交，将发送的表单字段如下：", "WARN")
+        for k, v in payload.items():
+            shown = str(v)
+            if len(shown) > 160:
+                shown = shown[:160] + f" ...(共 {len(str(v))} 字符)"
+            push_log(f"::clipboard::   {k} = {shown}")
+        return True, "演练模式：未提交", 0
+
+    url = build_url(URL_COURSE_REPORT) + "?func=1"
+    push_log(f"::time:: 提交表单: xnxq={st.get('sel_xnxq')!r} mcount={st.get('mcount')!r} "
+             f"viewstate={len(st.get('viewstate',''))}B")
     t0 = time.time() if should_measure_business_latency() else None
     r = session_post(
         url,
@@ -935,7 +1195,8 @@ def submit_selection(strid, campus):
         timeout=REQ_TIMEOUT,
         headers=build_request_headers(URL_COURSE_REPORT, {
             "Content-Type": "application/x-www-form-urlencoded",
-        })
+        }),
+        pace=True
     )
     req_ms = int((time.time() - t0) * 1000) if t0 is not None else -1
     if t0 is not None:
@@ -946,12 +1207,23 @@ def submit_selection(strid, campus):
     r.encoding = 'gbk'
     text = r.text
 
-    for kw in SNATCH_SUCCESS_KEYWORDS:
+    # 会话失效：自动重登后交给上层重试（提交这一步原先没有重登处理，长时段空跑会静默失败）
+    if any(kw in text for kw in SESSION_INVALID_SUBMIT_KEYWORDS):
+        invalidate_rpt_state()
+        ok, msg = relogin_if_needed("submit 遇到会话失效页面")
+        message = f"会话失效，已尝试重登({msg})，稍后重试"
+        _record_submit(payload, text, False, message)
+        return False, message, req_ms
+
+    # 明确的成功，以及"此前已选上过"（同样要用 verify 复核确认）
+    for kw in SNATCH_SUCCESS_KEYWORDS + SNATCH_ALREADY_KEYWORDS:
         if kw in text:
+            _record_submit(payload, text, True, kw)
             return True, kw, req_ms
 
     matched = [k for k in SNATCH_FAIL_KEYWORDS if k in text]
     if matched:
+        msg_line = ', '.join(matched)
         if '出错' in matched:
             try:
                 dump_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'error_dump.html')
@@ -960,8 +1232,16 @@ def submit_selection(strid, campus):
                 push_log(f"::warning:: 已保存出错响应到 {dump_path}", "WARN")
             except Exception as dump_err:
                 push_log(f"::warning:: 保存出错响应失败: {dump_err}", "WARN")
-        return False, ', '.join(matched), req_ms
-    return False, f"未知响应({len(text)}字节)", req_ms
+        # 页面状态类失败才重新检索（"人数已满"之类不需要，免得白跑两次检索请求）
+        if any(k in matched for k in STATE_STALE_KEYWORDS):
+            invalidate_rpt_state()
+        _record_submit(payload, text, False, msg_line)
+        return False, msg_line, req_ms
+
+    message = f"未知响应({len(text)}字节)"
+    _record_submit(payload, text, False, message)
+    invalidate_rpt_state()
+    return False, message, req_ms
 
 
 def build_strid(class_id, chk_value):
@@ -991,7 +1271,11 @@ def snatch_loop():
         target = app_state.get("target")
         filter_params = app_state.get("filter_params", {})
         interval = app_state["interval"]  # 用户填写的间隔（秒）
-        do_verify = app_state["verify_after"]
+        dry_run = app_state.get("dry_run", False)
+        # 选课结果一律以退选报表页为准，强制复核，不允许关闭：
+        # 只靠响应里的关键词判断会被页面文案误导（列表页的表头就叫"已选"，
+        # "成功"也会出现在"操作不成功"之类的文案里），误判会让循环提前收工。
+        do_verify = True
         app_state["snatch_interval"] = interval
         last_req_time = app_state.get("last_request_time", 0)
 
@@ -1035,6 +1319,9 @@ def snatch_loop():
     class_page_value = target.get('class_page_value') or target.get('course_value') or target.get('look_value') or target.get('value', '')
     full_course_value = target.get('full_course_value') or class_page_value
     class_skbjval = target.get('class_skbjval', '')
+    # 备用班级ID（见 fetch_class_list 里对选课 id 构造的说明）：首次提交被拒后换它再试一次
+    alt_token = target.get('alt_class_id') or ''
+    use_alt_token = False
 
     push_log(f"::success:: 开始选课，目标: {t_name} / {t_class_name}")
     attempt = 0
@@ -1114,13 +1401,15 @@ def snatch_loop():
                         is_full = True
 
             # 公选/直选课走"快捷直达"通道，页面本身不提供人数栏位（capacity 为空）。
-            # 这类课若因为解析不到人数就一直跳过提交，会永远选不上；所以只要不是
-            # 已知满员就直接提交，由服务器裁决（满了会返回"人数已满"）。
-            if not is_valid_capacity:
-                push_log(f"::warning:: [{attempt}] 无法解析班级人数 ({capacity_raw!r})，改为直接提交由服务器裁决", "WARN")
+            # 这类课若因为解析不到人数就一直跳过提交，会永远选不上；所以人数未知时
+            # 按"可能有余额"处理，直接提交让服务器裁决（已满会返回"人数已满"）。
+            if not is_valid_capacity and not capacity_raw.strip():
+                push_log(f"::warning:: [{attempt}] 无人数信息（直选通道），直接尝试提交", "WARN")
 
             # --- 2. 收到回复后，完整倒计时 interval 秒再发下一次请求 ---
-            if is_full:
+            # 演练模式不受余量影响：它的目的是验证参数构造，所以即使已满也继续往下走，
+            # 把要提交的表单打印出来（绝不会真的提交）。
+            if is_full and not dry_run:
                 push_log(f"::wait:: [{attempt}] 班级人数满 {capacity_raw}，{interval}s 后重试...{latency_suffix(class_fetch_ms)}")
                 app_state["snatch_phase"] = "waiting"
                 app_state["snatch_phase_start"] = time.time()
@@ -1128,14 +1417,20 @@ def snatch_loop():
                 if not wait_with_stop(max(interval, 0.5)):
                     return
                 continue
+            if is_full and dry_run:
+                push_log(f"::warning:: [演练模式] 班级已满({capacity_raw})，但演练不提交，继续构造表单", "WARN")
 
-            # === 人数未满（或人数未知）！立刻构造 strid 并提交 ===
-            if is_valid_capacity:
+            # === 人数未满（或人数未知）！立刻构造 strid ===
+            if dry_run and is_full:
+                push_log(f"::warning:: [{attempt}] [演练模式] 班级已满({capacity_raw})，继续构造表单但不提交", "WARN")
+            elif is_valid_capacity:
                 push_log(f"::success:: [{attempt}] 发现余量！({capacity_raw}) 准备发包...{latency_suffix(class_fetch_ms)}")
             else:
                 push_log(f"::success:: [{attempt}] 人数未知（公选/直选课），直接发包...{latency_suffix(class_fetch_ms)}")
 
-            if current_radio_val and '@' in current_radio_val:
+            if use_alt_token and alt_token:
+                skbj_token = alt_token
+            elif current_radio_val and '@' in current_radio_val:
                 skbj_token = current_radio_val.split('@', 1)[1]
             elif target_class_info.get('existing_class'):
                 skbj_token = target_class_info['existing_class']
@@ -1143,12 +1438,21 @@ def snatch_loop():
                 skbj_token = t_class_id
 
             strid = build_strid(skbj_token, full_course_value)
-            push_log(f"::success:: [{attempt}] 使用最新Token提交: {t_name} → {t_class_id}")
+            push_log(f"::success:: [{attempt}] 使用最新Token提交: {t_name} → {skbj_token}"
+                     f"{'（备用ID）' if use_alt_token else ''}")
 
             app_state["snatch_phase"] = "requesting"
             app_state["snatch_phase_start"] = time.time()
-            ok, msg, req_ms = submit_selection(strid, xq)
+            ok, msg, req_ms = submit_selection(strid, xq, dry_run=dry_run)
             push_log(f"::time:: [{attempt}] 本次提交请求耗时{latency_suffix(req_ms)}")
+            if dry_run:
+                push_log("::warning:: [演练模式] 已走到提交步骤并停下，未发送任何选课提交请求", "WARN")
+                with state_lock:
+                    app_state["snatch_running"] = False
+                    app_state["snatch_phase"] = "idle"
+                    app_state["snatch_success"] = False
+                    app_state["snatch_result"] = "演练模式：未提交"
+                return
             app_state["snatch_phase"] = "request_done"
             app_state["snatch_phase_start"] = time.time()
 
@@ -1195,6 +1499,17 @@ def snatch_loop():
                     if not wait_with_stop(wait_sec):
                         return
                     push_log(f"::success:: [{attempt}] 风控等待结束，继续抢课流程")
+                    continue
+
+                # 被拒（含"出错"这类硬性阻挡）时，先换备用班级ID再试一次，之后才考虑放弃/重开一轮
+                if alt_token and not use_alt_token:
+                    use_alt_token = True
+                    push_log(f"::warning:: [{attempt}] 提交被拒（{msg}），改用备用班级ID重试: {alt_token}", "WARN")
+                    app_state["snatch_phase"] = "waiting"
+                    app_state["snatch_phase_start"] = time.time()
+                    app_state["snatch_interval"] = interval
+                    if not wait_with_stop(max(interval, 0.5)):
+                        return
                     continue
 
                 if any(k in msg for k in SNATCH_STOP_KEYWORDS):
@@ -1381,6 +1696,15 @@ def api_filters():
         return jsonify({"ok": False, "msg": str(e)})
 
 
+@app.route('/api/submit_history')
+def api_submit_history():
+    """
+    返回最近几次选课提交的请求字段与响应片段（仅内存，用于排障）。
+    遇到"系统出错"这类看不清原因的失败时，先看这里。
+    """
+    return jsonify({"ok": True, "keep": SUBMIT_HISTORY_KEEP, "items": list(_submit_history)})
+
+
 @app.route('/api/ping')
 def api_ping():
     """返回纯网络延迟，用于反映网络质量"""
@@ -1446,8 +1770,15 @@ def api_set_target():
         # 动态存储所有筛选参数
         app_state["filter_params"] = {k: v for k, v in d.items() if k.startswith('sel') or k.startswith('Sel')}
         app_state["interval"] = float(d.get("interval", 0.3))
-        app_state["verify_after"] = d.get("verify_after", True)
+        # 复核是强制的，这里只记录调用方的意愿（snatch_loop 不会再关掉它）
+        app_state["verify_after"] = True
         app_state["measure_business_latency"] = d.get("measure_business_latency", False)
+        # 演练模式：走到提交前停下，只打印将发送的表单（不会真正提交）
+        app_state["dry_run"] = bool(d.get("dry_run", False))
+    if d.get("verify_after") is False:
+        push_log("::warning:: 已忽略 verify_after=false：选课结果复核是强制的", "WARN")
+    if app_state.get("dry_run"):
+        push_log("::warning:: 已启用演练模式：不会真正提交选课请求", "WARN")
     return jsonify({"ok": True})
 
 
@@ -1939,9 +2270,9 @@ select:focus, input:focus, button:focus {
         </div>
       </div>
       <label class="field custom-checkbox" style="margin-bottom:0.8rem;">
-        <input type="checkbox" id="chkVerify" checked>
+        <input type="checkbox" id="chkVerify" checked disabled>
         <span class="checkmark"></span>
-        <span style="font-size:.78rem;color:#ffffff;">选课后二次验证是否成功</span>
+        <span style="font-size:.78rem;color:#ffffff;">选课后二次验证是否成功（强制开启）</span>
       </label>
       <label class="field custom-checkbox" style="margin-bottom:0.8rem; margin-top:-0.25rem;">
         <input type="checkbox" id="chkBizLatency">
